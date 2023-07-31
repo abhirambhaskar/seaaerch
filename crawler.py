@@ -25,7 +25,7 @@ from PIL import Image
 from nudenet import NudeClassifier
 import uuid
 from io import BytesIO
-
+from concurrent.futures import wait,ThreadPoolExecutor
 class SeleniumMiddleware(SeleniumMiddleware):
     def __init__(self):
         super().__init__()
@@ -109,6 +109,8 @@ class MySpider(CrawlSpider):
 
     def __init__(self, *args, **kwargs):
         super(MySpider, self).__init__(*args, **kwargs)
+        self.data_list = []
+        self.image_data_list = []
         self.crawled_count = 0
         self.crawledimg_count = 0
         self.nlp = spacy.load("en_core_web_sm")  # Load English model
@@ -196,6 +198,20 @@ class MySpider(CrawlSpider):
         if response.url in self.processed_urls or response.url.startswith('https://web.archive.org'):
             return
 
+        # Process main URL
+        data = {}
+        
+        
+        with ThreadPoolExecutor(max_workers=22) as executor:
+            future1 = executor.submit(self.parse_text_content, response, data)
+            future2 = executor.submit(self.parse_images, response)
+
+        wait([future1, future2])  # Wait for both tasks to complete
+
+        yield data
+    
+    def parse_text_content(self, response, data):
+        
         g = Goose()
         article = g.extract(raw_html=response.body)
 
@@ -216,17 +232,16 @@ class MySpider(CrawlSpider):
         # Parse the HTML content using BeautifulSoup
         soup = BeautifulSoup(response.body, 'html.parser')
 
-        img_tags = BeautifulSoup(response.text, 'html.parser').find_all('img')
+        img_tags = soup.find_all('img')
 
         # Extract all the 'src' or 'data-src' attributes from the 'img' tags
         images = [img.get('src') if img.get('src') is not None else img.get('data-src') for img in img_tags]
-        
-        data_list = []
+
         large_images = []
         all_images = []
         for img_url in images:
             try:
-                response_img = httpx.get(img_url)
+                response_img = requests.get(img_url)
                 if response_img.status_code == 200:
                     img = Image.open(BytesIO(response_img.content))
                     all_images.append(img_url)  # Save all images
@@ -253,12 +268,18 @@ class MySpider(CrawlSpider):
             'country': self.country_code
         }
 
+        
+
         if not self.document_exists(response.url):
-            data_list.append(data)
+            self.data_list.append(data)
             self.save_backup(data)
-            if len(data_list) == 10:  # if the length of data_list reaches 10, save it to Meilisearch
-                self.save_to_meilisearch(data_list)
-                data_list.clear()
+            print(*self.data_list)
+            print("dataon backup"+str(len(self.data_list)))
+            if len(self.data_list) >= 10:  # if the length of data_list reaches 10, save it to Meilisearch
+                self.save_to_meilisearch(self.data_list)
+                self.data_list.clear()
+            
+
 
         self.processed_urls.add(response.url)
         self.crawled_count += 1
@@ -266,35 +287,55 @@ class MySpider(CrawlSpider):
         if self.crawled_count % 20 == 0:
             self.upload_to_bunnycdn(self.temp_csv_filename)
 
-        # # Save remaining data if it's less than 10 and hasn't been saved yet
-        # if data_list:  
-        #     self.save_to_meilisearch(data_list)
-        #     data_list = []  
 
+    def parse_images(self, response):
+        soup = BeautifulSoup(response.body, 'html.parser')
         image_tags = soup.find_all('img')
 
-        # Get the website title from the <title> tag
-        website_title = soup.title.get_text(strip=True) if soup.title else None
-        
-        image_data_list = []
-        # Find all image tags in the HTML
+        meta_description_tag = soup.find('meta', attrs={'name': 'description'})
+        description = meta_description_tag.get('content') if meta_description_tag else None
+        content = self.extract_content(response)
+
+        if not description:
+            description = content
+
+        keywords = self.extract_keywords(description, content)
+
+
+        print(f'Found {len(image_tags)} images')
+
+        try:
+            website_title = soup.title.get_text(strip=True) if soup.title else None
+        except Exception as e:
+            print(f"Error occurred: {e}")
+            print(f"Type of soup.title: {type(soup.title)}")
+            
+
+        print("Before keywords extraction")
+        try:
+            keywords = self.extract_keywords(description, content)
+        except Exception as e:
+            print(f"Error occurred during keyword extraction: {e}")
+        print("After keywords extraction")
+
+        print("Before the loop")
         for img in image_tags:
+            print("Inside the loop")
             src = img.get('src', '')
             alt = img.get('alt', '')
             image_title = alt.strip() if alt and not alt.lower().startswith('image') else None
+            print("Before try block")
             if not image_title:
                 heading_or_paragraph_or_title_text = self.get_heading_or_paragraph_or_title_text(img.parent,website_title)
                 image_title = heading_or_paragraph_or_title_text if heading_or_paragraph_or_title_text else None
             if src:
                 image_url = urljoin(response.url, src)
 
-                # Check if the image URL points to a valid image
                 try:
-                    response_img = httpx.get(image_url, timeout=5)
+                    response_img = requests.get(image_url, timeout=5)
                     img = Image.open(BytesIO(response_img.content))  # Try to open the response content as an image
                     img.verify()  # Verify that the image data is valid
 
-                    # Check if the image is at least 80x80 pixels
                     width, height = img.size
                     if width < 80 or height < 80:
                         print(f"Image is too small: {image_url}")
@@ -309,10 +350,10 @@ class MySpider(CrawlSpider):
                         'link': response.url,
                         'keywords': keywords,
                         'safe_search': nsfw_score,
-                        'country':self.country_code
+                        'country': self.country_code
                     }
 
-                except (httpx.RequestError, IOError) as e:
+                except (requests.RequestException, IOError) as e:
                     print(f"Failed to fetch or open image: {image_url}. {e}")
                     continue 
 
@@ -322,17 +363,15 @@ class MySpider(CrawlSpider):
                     self.upload_to_bunnycdn_image(self.temp_csv_filename_image)
 
                 if not self.documentimage_exists(image_url):
-                    image_data_list.append(image_data)
+                    self.image_data_list.append(image_data)
                     self.save_backup_image(image_data)
-                    if len(image_data_list) == 10:
-                        self.save_to_meilisearch_image(image_data_list)
-                        image_data_list = []
+                    print("dataon img backup"+str(len(self.image_data_list)))
+                    if len(self.image_data_list) >= 10:
+                        self.save_to_meilisearch_image(self.image_data_list)
+                        self.image_data_list.clear() 
 
-        # if image_data_list:  
-        #     self.save_to_meilisearch_image(image_data_list)
-        #     image_data_list = []
 
-        yield data 
+
 
 
    
